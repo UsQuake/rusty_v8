@@ -1,4 +1,4 @@
-# Rusty V8 Binding
+# Rusty V8 Binding with AFL Fuzzer
 
 V8 Version: 11.6.189.7
 
