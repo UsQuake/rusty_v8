@@ -15,8 +15,8 @@ use std::ptr::{addr_of, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use v8::fast_api::CType;
 use v8::fast_api::Type::*;
+use v8::fast_api::{CType, FastApiTypedArray};
 use v8::inspector::ChannelBase;
 use v8::{fast_api, AccessorConfiguration};
 
@@ -46,16 +46,16 @@ mod setup {
   fn initialize_once() {
     static START: Once = Once::new();
     START.call_once(|| {
-    assert!(v8::icu::set_common_data_72(align_data::include_aligned!(
+    assert!(v8::icu::set_common_data_73(align_data::include_aligned!(
       align_data::Align16,
       "../third_party/icu/common/icudtl.dat"
     ))
     .is_ok());
     v8::V8::set_flags_from_string(
-      "--no_freeze_flags_after_init --expose_gc --harmony-import-assertions --harmony-shadow-realm --allow_natives_syntax --turbo_fast_api_calls",
+      "--no_freeze_flags_after_init --expose_deno_builtins --expose_gc --harmony-import-assertions --harmony-shadow-realm --allow_natives_syntax --turbo_fast_api_calls",
     );
     v8::V8::initialize_platform(
-      v8::new_default_platform(0, false).make_shared(),
+      v8::new_unprotected_default_platform(0, false).make_shared(),
     );
     v8::V8::initialize();
   });
@@ -679,8 +679,8 @@ fn get_isolate_from_handle() {
     check_handle_helper(scope, expect_some, local2);
   }
 
-  fn check_eval<'s>(
-    scope: &mut v8::HandleScope<'s>,
+  fn check_eval(
+    scope: &mut v8::HandleScope,
     expect_some: Option<bool>,
     code: &str,
   ) {
@@ -828,6 +828,52 @@ fn array_buffer() {
     assert_eq!(10, shared_bs_2.byte_length());
     assert_eq!(shared_bs_2[0].get(), 0);
     assert_eq!(shared_bs_2[9].get(), 9);
+
+    // Empty
+    let ab = v8::ArrayBuffer::empty(scope);
+    assert_eq!(0, ab.byte_length());
+    assert!(!ab.get_backing_store().is_shared());
+
+    // Empty but from vec
+    let ab = v8::ArrayBuffer::with_backing_store(
+      scope,
+      &v8::ArrayBuffer::new_backing_store_from_bytes(vec![]).make_shared(),
+    );
+    assert_eq!(0, ab.byte_length());
+    assert!(!ab.get_backing_store().is_shared());
+
+    // Empty but from vec with a huge capacity
+    let mut v = Vec::with_capacity(10_000_000);
+    v.extend_from_slice(&[1, 2, 3, 4]);
+    let ab = v8::ArrayBuffer::with_backing_store(
+      scope,
+      &v8::ArrayBuffer::new_backing_store_from_bytes(v).make_shared(),
+    );
+    // Allocate a completely unused buffer overtop of the old allocation
+    let mut v2: Vec<u8> = Vec::with_capacity(10_000_000);
+    v2.extend_from_slice(&[10, 20, 30, 40]);
+    // Make sure the the arraybuffer didn't get stomped
+    assert_eq!(4, ab.byte_length());
+    assert_eq!(1, ab.get_backing_store()[0].get());
+    assert_eq!(2, ab.get_backing_store()[1].get());
+    assert_eq!(3, ab.get_backing_store()[2].get());
+    assert_eq!(4, ab.get_backing_store()[3].get());
+    assert!(!ab.get_backing_store().is_shared());
+    drop(v2);
+
+    // From a bytes::BytesMut
+    let mut data = bytes::BytesMut::new();
+    data.extend_from_slice(&[100; 16]);
+    data[0] = 1;
+    let unique_bs =
+      v8::ArrayBuffer::new_backing_store_from_bytes(Box::new(data));
+    assert_eq!(unique_bs.get(0).unwrap().get(), 1);
+    assert_eq!(unique_bs.get(15).unwrap().get(), 100);
+
+    let ab =
+      v8::ArrayBuffer::with_backing_store(scope, &unique_bs.make_shared());
+    assert_eq!(ab.byte_length(), 16);
+    assert_eq!(ab.get_backing_store().get(0).unwrap().get(), 1);
   }
 }
 
@@ -2437,6 +2483,35 @@ fn object_template_set_named_property_handler() {
       .unwrap()
       .boolean_value(scope));
     assert!(eval(scope, "obj.panicOnGet").unwrap().is_string());
+
+    // Test `v8::NamedPropertyHandlerConfiguration::*_raw()` methods
+    {
+      let templ = v8::ObjectTemplate::new(scope);
+      templ.set_internal_field_count(1);
+      templ.set_named_property_handler(
+        v8::NamedPropertyHandlerConfiguration::new()
+          .getter_raw(getter.map_fn_to())
+          .setter_raw(setter.map_fn_to())
+          .query_raw(query.map_fn_to())
+          .flags(v8::PropertyHandlerFlags::NON_MASKING),
+      );
+
+      let obj = templ.new_instance(scope).unwrap();
+      obj.set_internal_field(0, int.into());
+      scope.get_current_context().global(scope).set(
+        scope,
+        name.into(),
+        obj.into(),
+      );
+      assert!(!eval(scope, "'panicOnGet' in obj")
+        .unwrap()
+        .boolean_value(scope));
+      eval(scope, "obj.panicOnGet = 'x'").unwrap();
+      assert!(eval(scope, "'panicOnGet' in obj")
+        .unwrap()
+        .boolean_value(scope));
+      assert!(eval(scope, "obj.panicOnGet").unwrap().is_string());
+    }
   }
 }
 
@@ -4453,8 +4528,8 @@ fn mock_script_origin<'s>(
   )
 }
 
-fn mock_source<'s>(
-  scope: &mut v8::HandleScope<'s>,
+fn mock_source(
+  scope: &mut v8::HandleScope,
   resource_name: &str,
   source: &str,
 ) -> v8::script_compiler::Source {
@@ -4993,22 +5068,36 @@ fn array_buffer_view() {
     let scope = &mut v8::HandleScope::new(isolate);
     let context = v8::Context::new(scope);
     let scope = &mut v8::ContextScope::new(scope, context);
-    let source =
-      v8::String::new(scope, "new Uint8Array([23,23,23,23])").unwrap();
+    let source = v8::String::new(
+      scope,
+      "new Uint8Array(new Uint8Array([22,22,23,23,23,23]).buffer, 2, 4)",
+    )
+    .unwrap();
     let script = v8::Script::compile(scope, source, None).unwrap();
     source.to_rust_string_lossy(scope);
     let result: v8::Local<v8::ArrayBufferView> =
       script.run(scope).unwrap().try_into().unwrap();
     assert_eq!(result.byte_length(), 4);
-    assert_eq!(result.byte_offset(), 0);
+    assert_eq!(result.byte_offset(), 2);
     let mut dest = [0; 4];
     let copy_bytes = result.copy_contents(&mut dest);
     assert_eq!(copy_bytes, 4);
     assert_eq!(dest, [23, 23, 23, 23]);
+    let slice = unsafe {
+      std::slice::from_raw_parts(
+        result.data() as *const u8,
+        result.byte_length(),
+      )
+    };
+    assert_eq!(dest, slice);
     let maybe_ab = result.buffer(scope);
     assert!(maybe_ab.is_some());
     let ab = maybe_ab.unwrap();
-    assert_eq!(ab.byte_length(), 4);
+    assert_eq!(ab.byte_length(), 6);
+    assert_eq!(
+      result.get_backing_store().unwrap().data(),
+      ab.get_backing_store().data()
+    );
   }
 }
 
@@ -5280,7 +5369,7 @@ fn external_references() {
   let external_ptr = Box::into_raw(vec![0_u8, 1, 2, 3, 4].into_boxed_slice())
     as *mut [u8] as *mut c_void;
   // Push them to the external reference table.
-  let refs = v8::ExternalReferences::new(&[
+  let refs = [
     v8::ExternalReference {
       function: fn_callback.map_fn_to(),
     },
@@ -5290,7 +5379,10 @@ fn external_references() {
     v8::ExternalReference {
       pointer: external_ptr,
     },
-  ]);
+  ];
+  // Exercise the Debug impl
+  println!("{refs:?}");
+  let refs = v8::ExternalReferences::new(&refs);
   // TODO(piscisaureus): leaking the `ExternalReferences` collection shouldn't
   // be necessary. The reference needs to remain valid for the lifetime of the
   // `SnapshotCreator` or `Isolate` that uses it, which would be the case here
@@ -5565,6 +5657,11 @@ fn shared_array_buffer() {
     assert_eq!(shared_bs_3.byte_length(), 10);
     assert_eq!(shared_bs_3[0].get(), 0);
     assert_eq!(shared_bs_3[9].get(), 9);
+
+    // Empty
+    let ab = v8::SharedArrayBuffer::empty(scope);
+    assert_eq!(ab.byte_length(), 0);
+    assert!(ab.get_backing_store().is_shared());
   }
 }
 
@@ -6713,6 +6810,85 @@ fn get_own_property_descriptor() {
 }
 
 #[test]
+fn preview_entries() {
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  {
+    let obj = eval(
+      scope,
+      "var set = new Set([1,2,3]); set.delete(1); set.keys()",
+    )
+    .unwrap();
+    let obj = obj.to_object(scope).unwrap();
+    let (preview, is_key_value) = obj.preview_entries(scope);
+    let preview = preview.unwrap();
+    assert!(!is_key_value);
+    assert_eq!(preview.length(), 2);
+    assert_eq!(
+      preview
+        .get_index(scope, 0)
+        .unwrap()
+        .number_value(scope)
+        .unwrap(),
+      2.0
+    );
+    assert_eq!(
+      preview
+        .get_index(scope, 1)
+        .unwrap()
+        .number_value(scope)
+        .unwrap(),
+      3.0
+    );
+  }
+
+  {
+    let obj = eval(
+      scope,
+      "var set = new Set([1,2,3]); set.delete(2); set.entries()",
+    )
+    .unwrap();
+    let obj = obj.to_object(scope).unwrap();
+    let (preview, is_key_value) = obj.preview_entries(scope);
+    let preview = preview.unwrap();
+    assert!(is_key_value);
+    assert_eq!(preview.length(), 4);
+    let first = preview
+      .get_index(scope, 0)
+      .unwrap()
+      .number_value(scope)
+      .unwrap();
+    let second = preview
+      .get_index(scope, 2)
+      .unwrap()
+      .number_value(scope)
+      .unwrap();
+    assert_eq!(first, 1.0);
+    assert_eq!(second, 3.0);
+    assert_eq!(
+      first,
+      preview
+        .get_index(scope, 1)
+        .unwrap()
+        .number_value(scope)
+        .unwrap(),
+    );
+    assert_eq!(
+      second,
+      preview
+        .get_index(scope, 3)
+        .unwrap()
+        .number_value(scope)
+        .unwrap(),
+    );
+  }
+}
+
+#[test]
 fn test_prototype_api() {
   let _setup_guard = setup::parallel_test();
   let isolate = &mut v8::Isolate::new(Default::default());
@@ -7263,13 +7439,23 @@ fn symbol() {
   let s = v8::Symbol::new(scope, Some(desc));
   assert!(s.description(scope) == desc);
 
-  let s_pub = v8::Symbol::for_global(scope, desc);
+  let s_pub = v8::Symbol::for_key(scope, desc);
   assert!(s_pub.description(scope) == desc);
   assert!(s_pub != s);
 
-  let s_pub2 = v8::Symbol::for_global(scope, desc);
+  let s_pub2 = v8::Symbol::for_key(scope, desc);
   assert!(s_pub2 != s);
   assert!(s_pub == s_pub2);
+
+  let s_api = v8::Symbol::for_api(scope, desc);
+  assert!(s_api.description(scope) == desc);
+  assert!(s_api != s);
+  assert!(s_api != s_pub);
+
+  let s_api2 = v8::Symbol::for_api(scope, desc);
+  assert!(s_api2 != s);
+  assert!(s_api2 != s_pub);
+  assert!(s_api == s_api2);
 
   let context = v8::Context::new(scope);
   let scope = &mut v8::ContextScope::new(scope, context);
@@ -8082,7 +8268,7 @@ fn icu_date() {
 
 #[test]
 fn icu_set_common_data_fail() {
-  assert!(v8::icu::set_common_data_72(&[1, 2, 3]).is_err());
+  assert!(v8::icu::set_common_data_73(&[1, 2, 3]).is_err());
 }
 
 #[test]
@@ -8398,6 +8584,9 @@ fn compile_function() {
   assert_eq!(42 * 1337, result.int32_value(scope).unwrap());
 }
 
+static EXAMPLE_STRING: v8::OneByteConst =
+  v8::String::create_external_onebyte_const(b"const static");
+
 #[test]
 fn external_strings() {
   let _setup_guard = setup::parallel_test();
@@ -8464,6 +8653,17 @@ fn external_strings() {
   assert!(!latin1.is_external_twobyte());
   assert!(latin1.is_onebyte());
   assert!(latin1.contains_only_onebyte());
+
+  // one-byte "const" test
+  let const_ref_string =
+    v8::String::new_from_onebyte_const(scope, &EXAMPLE_STRING).unwrap();
+  assert!(const_ref_string.is_external());
+  assert!(const_ref_string.is_external_onebyte());
+  assert!(!const_ref_string.is_external_twobyte());
+  assert!(const_ref_string.is_onebyte());
+  assert!(const_ref_string.contains_only_onebyte());
+  assert!(const_ref_string
+    .strict_equals(v8::String::new(scope, "const static").unwrap().into()));
 }
 
 #[test]
@@ -9429,6 +9629,64 @@ fn test_fast_calls() {
   "#;
   eval(scope, source).unwrap();
   assert_eq!("fast", unsafe { WHO });
+}
+
+#[test]
+fn test_fast_calls_empty_buffer() {
+  static mut WHO: &str = "none";
+  unsafe fn fast_fn(
+    _recv: v8::Local<v8::Object>,
+    buffer: *mut FastApiTypedArray<u8>,
+  ) {
+    assert_eq!(WHO, "slow");
+    WHO = "fast";
+    assert_eq!(
+      0,
+      FastApiTypedArray::get_storage_from_pointer_if_aligned(buffer)
+        .unwrap()
+        .len()
+    );
+  }
+
+  fn slow_fn(
+    _scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+  ) {
+    unsafe {
+      WHO = "slow";
+    }
+  }
+
+  const FAST_TEST: fast_api::FastFunction = fast_api::FastFunction::new(
+    &[V8Value, TypedArray(CType::Uint8)],
+    fast_api::CType::Void,
+    fast_fn as _,
+  );
+
+  let _setup_guard = setup::parallel_test();
+  let isolate = &mut v8::Isolate::new(Default::default());
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  let global = context.global(scope);
+
+  let template = v8::FunctionTemplate::builder(slow_fn)
+    .build_fast(scope, &FAST_TEST, None, None, None);
+
+  let name = v8::String::new(scope, "func").unwrap();
+  let value = template.get_function(scope).unwrap();
+  global.set(scope, name.into(), value.into()).unwrap();
+  let source = r#"
+    function f(arr) { func(arr); }
+    %PrepareFunctionForOptimization(f);
+    f(new Uint8Array(0));
+    %OptimizeFunctionOnNextCall(f);
+    f(new Uint8Array(0));
+  "#;
+  eval(scope, source).unwrap();
+  assert_eq!(unsafe { WHO }, "fast");
 }
 
 #[test]
@@ -10521,4 +10779,142 @@ fn exception_thrown_but_continues_execution() {
   let scope = &mut v8::TryCatch::new(scope);
   let _result = script.run(scope);
   assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn disallow_javascript_execution_scope() {
+  let _setup_guard = setup::parallel_test();
+
+  let mut isolate = v8::Isolate::new(Default::default());
+  let mut scope = v8::HandleScope::new(&mut isolate);
+  let context = v8::Context::new(&mut scope);
+  let mut scope = v8::ContextScope::new(&mut scope, context);
+
+  // We can run JS before the scope begins.
+  assert_eq!(
+    eval(&mut scope, "42").unwrap().uint32_value(&mut scope),
+    Some(42)
+  );
+
+  {
+    let try_catch = &mut v8::TryCatch::new(&mut scope);
+    {
+      let scope = &mut v8::DisallowJavascriptExecutionScope::new(
+        try_catch,
+        v8::OnFailure::ThrowOnFailure,
+      );
+      assert!(eval(scope, "42").is_none());
+    }
+    assert!(try_catch.has_caught());
+    try_catch.reset();
+  }
+
+  // And we can run JS after the scope ends.
+  assert_eq!(
+    eval(&mut scope, "42").unwrap().uint32_value(&mut scope),
+    Some(42)
+  );
+}
+
+// TODO: Test DisallowJavascriptExecutionScope with OnFailure::CrashOnFailure
+// and OnFailure::DumpOnFailure. #[should_panic] obviously doesn't work on
+// those.
+
+#[test]
+fn allow_javascript_execution_scope() {
+  let _setup_guard = setup::parallel_test();
+
+  let mut isolate = v8::Isolate::new(Default::default());
+  let mut scope = v8::HandleScope::new(&mut isolate);
+  let context = v8::Context::new(&mut scope);
+  let mut scope = v8::ContextScope::new(&mut scope, context);
+
+  let disallow_scope = &mut v8::DisallowJavascriptExecutionScope::new(
+    &mut scope,
+    v8::OnFailure::CrashOnFailure,
+  );
+  let allow_scope = &mut v8::AllowJavascriptExecutionScope::new(disallow_scope);
+  assert_eq!(
+    eval(allow_scope, "42").unwrap().uint32_value(allow_scope),
+    Some(42)
+  );
+}
+
+#[test]
+fn allow_scope_in_read_host_object() {
+  // The scope that is passed to ValueDeserializerImpl::read_host_object is
+  // internally a DisallowJavascriptExecutionScope, so an allow scope must be
+  // created in order to run JS code in that callback.
+  struct Serializer;
+  impl v8::ValueSerializerImpl for Serializer {
+    fn write_host_object<'s>(
+      &mut self,
+      _scope: &mut v8::HandleScope<'s>,
+      _object: v8::Local<'s, v8::Object>,
+      _value_serializer: &mut dyn v8::ValueSerializerHelper,
+    ) -> Option<bool> {
+      // Doesn't look at the object or writes anything.
+      Some(true)
+    }
+
+    fn throw_data_clone_error<'s>(
+      &mut self,
+      _scope: &mut v8::HandleScope<'s>,
+      _message: v8::Local<'s, v8::String>,
+    ) {
+      todo!()
+    }
+  }
+
+  struct Deserializer;
+  impl v8::ValueDeserializerImpl for Deserializer {
+    fn read_host_object<'s>(
+      &mut self,
+      scope: &mut v8::HandleScope<'s>,
+      _value_deserializer: &mut dyn v8::ValueDeserializerHelper,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+      let scope2 = &mut v8::AllowJavascriptExecutionScope::new(scope);
+      let value = eval(scope2, "{}").unwrap();
+      let object = v8::Local::<v8::Object>::try_from(value).unwrap();
+      Some(object)
+    }
+  }
+
+  let _setup_guard = setup::parallel_test();
+
+  let mut isolate = v8::Isolate::new(Default::default());
+  let mut scope = v8::HandleScope::new(&mut isolate);
+  let context = v8::Context::new(&mut scope);
+  let mut scope = v8::ContextScope::new(&mut scope, context);
+
+  let serialized = {
+    let mut serializer =
+      v8::ValueSerializer::new(&mut scope, Box::new(Serializer));
+    serializer
+      .write_value(context, v8::Object::new(&mut scope).into())
+      .unwrap();
+    serializer.release()
+  };
+
+  let mut deserializer =
+    v8::ValueDeserializer::new(&mut scope, Box::new(Deserializer), &serialized);
+  let value = deserializer.read_value(context).unwrap();
+  assert!(value.is_object());
+}
+
+#[test]
+fn has_deno_builtins() {
+  let _setup_guard = setup::parallel_test();
+
+  let isolate = &mut v8::Isolate::new(Default::default());
+
+  let scope = &mut v8::HandleScope::new(isolate);
+  let context = v8::Context::new(scope);
+  let scope = &mut v8::ContextScope::new(scope, context);
+
+  for builtin_name in &["fromUtf8", "toUtf8", "isOneByte"] {
+    let name = v8::String::new(scope, builtin_name).unwrap();
+    let value = context.global(scope).get(scope, name.into()).unwrap();
+    assert!(value.is_function());
+  }
 }
